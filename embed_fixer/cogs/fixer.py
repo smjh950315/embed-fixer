@@ -145,7 +145,7 @@ class FixerCog(commands.Cog):
             break
         return domain, website
 
-    async def _find_fixes(  # noqa: PLR0912, PLR0914
+    async def _find_fixes(  # noqa: PLR0912, PLR0914, PLR0915
         self,
         message: discord.Message,
         *,
@@ -166,12 +166,23 @@ class FixerCog(commands.Cog):
             isinstance(message.channel, discord.TextChannel) and message.channel.nsfw
         )
         urls = extract_urls(message.content)
-
-        for url, spoilered in urls:
+        i = 0
+        while i < len(urls):
+            url, spoilered = urls[i]
+            i += 1
             clean_url = remove_query_params(url).replace("www.", "")
             domain, website = self._get_matching_domain_website(settings, clean_url)
 
             if domain is None or website is None:
+                continue
+
+            if domain.id == DomainId.PTT:
+                try:
+                    extracted = await self.fetch_info.ptt(url)
+                except Exception:
+                    logger.exception(f"Failed to fetch PTT page {url}")
+                    continue
+                urls.extend((u, spoilered) for u in extracted)
                 continue
 
             pixiv_skip = (

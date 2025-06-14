@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from loguru import logger
 from pydantic import BaseModel, Field, field_validator
 
-from embed_fixer.utils.misc import remove_html_tags, replace_domain
+from embed_fixer.utils.misc import extract_urls, remove_html_tags, replace_domain
 
 if TYPE_CHECKING:
     import aiohttp
@@ -155,6 +155,16 @@ class PostInfoFetcher:
             return []
 
         return [f"https://fxbilibili.seria.moe/dl/{bvid}"]
+
+    async def ptt(self, url: str) -> list[str]:
+        cookies = {"over18": "1"}
+        async with self.session.get(url, cookies=cookies) as resp:
+            if resp.status != 200:
+                return []
+            text = await resp.text()
+
+        text = remove_html_tags(text)
+        return [u for u, _ in extract_urls(text)]
 
 
 class PixivArtwork(BaseModel):

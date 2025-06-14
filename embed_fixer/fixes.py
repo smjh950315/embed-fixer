@@ -21,6 +21,7 @@ class DomainId(IntEnum):
     BILIBILI = 12
     TUMBLR = 13
     THREADS = 14
+    PTT = 15
 
 
 @dataclass(kw_only=True)
@@ -397,5 +398,11 @@ DOMAINS: Final[list[Domain]] = [
                 repo_url="https://github.com/everettsouthwick/vxThreads",
             ),
         ],
+    ),
+    Domain(
+        id=DomainId.PTT,
+        name="PTT",
+        websites=[Website(r"https://(www\.)?ptt\.cc/bbs/\w+/[\w.]+\.html")],
+        fix_methods=[],
     ),
 ]
