@@ -199,12 +199,18 @@ class FixerCog(commands.Cog):
 
     @staticmethod
     def _get_matching_domain_website(
-        settings: GuildSettings | None, clean_url: str
+        settings: GuildSettings | None,
+        clean_url: str,
+        *,
+        skipped_domain_ids: set[DomainId] | None = None,
     ) -> tuple[Domain | None, Website | None]:
         domain: Domain | None = None
         website: Website | None = None
 
         for d in DOMAINS:
+            if skipped_domain_ids is not None and d.id in skipped_domain_ids:
+                continue
+
             if settings is not None and d.id in settings.disabled_domains:
                 continue
 
@@ -234,6 +240,7 @@ class FixerCog(commands.Cog):
         filesize_limit: int,
         extract_media: bool = False,
         is_ctx_menu: bool = False,
+        skipped_domain_ids: set[DomainId] | None = None,
     ) -> FindFixResult:
         channel_id = message.channel.id
 
@@ -266,11 +273,30 @@ class FixerCog(commands.Cog):
                 logger.warning(f"Invalid URL found: {url}")
                 continue
 
-            domain, website = self._get_matching_domain_website(settings, clean_url)
+            domain, website = self._get_matching_domain_website(
+                settings, clean_url, skipped_domain_ids=skipped_domain_ids
+            )
 
             if domain is None or website is None:
                 continue
             logger.debug(f"Matched domain {domain.id!r} for URL: {clean_url}")
+
+            if domain.id is DomainId.PTT:
+                nested_result, nested_content = await self._expand_ptt_url(
+                    message,
+                    url,
+                    settings=settings,
+                    filesize_limit=filesize_limit,
+                    extract_media=extract_media,
+                    is_ctx_menu=is_ctx_menu,
+                )
+                if nested_result is not None:
+                    fix_found = True
+                    medias.extend(nested_result.medias)
+                    sauces.extend(nested_result.sauces)
+                    content, author_md = nested_result.content, nested_result.author_md
+                    message.content = message.content.replace(url, nested_content)
+                    continue
 
             if await self._nsfw_skip(url, domain, is_nsfw_channel=is_nsfw_channel):
                 continue
@@ -365,6 +391,62 @@ class FixerCog(commands.Cog):
             author_md=author_md,
             urls=[url for url, _ in urls],
         )
+
+    async def _expand_ptt_url(
+        self,
+        message: discord.Message | MockMessage,
+        url: str,
+        *,
+        settings: GuildSettings | None,
+        filesize_limit: int,
+        extract_media: bool,
+        is_ctx_menu: bool,
+    ) -> tuple[FindFixResult | None, str]:
+        ptt_result = await self.fetch_info.ptt(url)
+        if ptt_result is None:
+            return None, url
+
+        _, embedded_urls = ptt_result
+        nested_urls: list[str] = []
+
+        for embedded_url in embedded_urls:
+            try:
+                clean_embedded_url = remove_query_params(embedded_url).replace("www.", "")
+            except ValueError:
+                continue
+
+            domain, _ = self._get_matching_domain_website(
+                settings,
+                clean_embedded_url,
+                skipped_domain_ids={DomainId.PTT},
+            )
+            if domain is None:
+                continue
+
+            nested_urls.append(embedded_url)
+
+        nested_urls = list(dict.fromkeys(nested_urls))
+        if not nested_urls:
+            return None, url
+
+        nested_message = MockMessage(
+            content="\n".join(nested_urls),
+            channel=message.channel,
+            guild=message.guild,
+            author=message.author,
+        )
+        nested_result = await self._find_fixes(
+            nested_message,
+            settings=settings,
+            filesize_limit=filesize_limit,
+            extract_media=extract_media,
+            is_ctx_menu=is_ctx_menu,
+            skipped_domain_ids={DomainId.PTT},
+        )
+        if not nested_result.fix_found:
+            return None, url
+
+        return nested_result, nested_message.content.strip()
 
     async def _extract_post_info(
         self, domain_id: DomainId, url: str, *, spoiler: bool = False, filesize_limit: int

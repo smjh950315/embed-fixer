@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import html
 import re
 from typing import TYPE_CHECKING, Any, Final
 
@@ -56,6 +57,24 @@ class PostInfoFetcher:
     def _extract_bilibili_id(url: str) -> str | None:
         match = re.search(r"bilibili.com/video/([\w]+)", url)
         return match.group(1) if match else None
+
+    @staticmethod
+    def _extract_ptt_main_content(html_content: str) -> str:
+        match = re.search(
+            r'<div id="main-content".*?>(.*?)<div class="push">',
+            html_content,
+            flags=re.DOTALL,
+        )
+        content = match.group(1) if match else html_content
+        content = re.sub(r"<script.*?</script>", "", content, flags=re.DOTALL)
+        content = re.sub(r"<style.*?</style>", "", content, flags=re.DOTALL)
+        return html.unescape(remove_html_tags(content))
+
+    @staticmethod
+    def _extract_ptt_urls(html_content: str, text_content: str) -> list[str]:
+        href_urls = re.findall(r'href="(https?://[^"]+)"', html_content)
+        text_urls = re.findall(r"https?://[^\s<>]+", text_content)
+        return list(dict.fromkeys([*href_urls, *text_urls]))
 
     async def pixiv(self, url: str) -> PixivArtwork | None:
         artwork_id = self._extract_pixiv_id(url)
@@ -153,6 +172,24 @@ class PostInfoFetcher:
                 urls.append(f"https://n3.kemono.su/data{attachment['path']}?f={attachment['name']}")
 
         return urls
+
+    async def ptt(self, url: str) -> tuple[str, list[str]] | None:
+        headers = {"User-Agent": "EmbedFixer/1.0"}
+
+        async with self.session.get(
+            url,
+            headers=headers,
+            cookies={"over18": "1"},
+            ssl=False,
+        ) as response:
+            if response.status != 200:
+                return None
+
+            html_content = await response.text()
+
+        text_content = self._extract_ptt_main_content(html_content)
+        urls = self._extract_ptt_urls(html_content, text_content)
+        return text_content, urls
 
 
 class PixivArtwork(BaseModel):
