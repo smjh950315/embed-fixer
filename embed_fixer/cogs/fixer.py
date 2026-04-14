@@ -28,6 +28,7 @@ from embed_fixer.utils.misc import (
     sanitize_username,
     unsanitize_username,
 )
+from embed_fixer.utils.message_archive import archive_message
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -231,6 +232,15 @@ class FixerCog(commands.Cog):
         # FxEmbed (fxtwitter) can translate posts by appending /{lang}
         # See https://github.com/FxEmbed/FxEmbed#translate-posts-xtwitter for more info
         return append_path_to_url(url, f"/{translang}")
+
+    @staticmethod
+    def _get_processed_url_pairs(original_urls: list[str], content: str) -> list[tuple[str, str]]:
+        processed_urls = [url for url, _ in extract_urls(content)]
+        return [
+            (original_url, processed_url)
+            for original_url, processed_url in zip(original_urls, processed_urls, strict=False)
+            if processed_url != original_url
+        ]
 
     async def _find_fixes(  # noqa: C901, PLR0912, PLR0914, PLR0915
         self,
@@ -1105,6 +1115,8 @@ class FixerCog(commands.Cog):
         ):
             return
 
+        await archive_message(message)
+
         try:
             result = await self._find_fixes(
                 message, settings=guild_settings, filesize_limit=guild.filesize_limit
@@ -1116,6 +1128,11 @@ class FixerCog(commands.Cog):
         logger.debug(f"FindFixResult for message {message.id} in {guild.id=}: {result}")
 
         if result.fix_found:
+            await archive_message(
+                message,
+                url_pairs=self._get_processed_url_pairs(result.urls, message.content),
+                medias=result.medias,
+            )
             try:
                 send_type = await self._send_fixes(
                     message,
