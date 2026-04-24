@@ -199,6 +199,7 @@ docker run -v /my/mnt/logs:/app/logs -v /my/mnt/data:/data -e DISCORD_TOKEN=YOUR
 - `DB_URI`: defaults to `sqlite:///data/embed_fixer.db`, available to customize the database location
 - `ENV`: defaults to `prod`, can be set to `dev` for development mode
 - `REDIS_URL`: if set, uses Redis for caching instead of SQLite
+- `MEDIA_DOWNLOAD_DIR`: defaults to `/data/downloaded-images`, stores archived fixed embed images
 
 ## Local
 

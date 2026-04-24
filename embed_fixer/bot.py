@@ -15,6 +15,7 @@ from tortoise.expressions import Subquery
 from embed_fixer.core.command_tree import CommandTree
 from embed_fixer.core.db_config import TORTOISE_ORM
 from embed_fixer.core.translator import translator
+from embed_fixer.utils.message_archive import init_message_archive_schema
 from embed_fixer.utils.misc import get_project_version
 
 from .core.translator import AppCommandTranslator
@@ -93,6 +94,7 @@ class EmbedFixer(commands.AutoShardedBot):
 
         await Tortoise.init(TORTOISE_ORM)
         await Tortoise.generate_schemas()
+        await init_message_archive_schema()
         await self._migrate_guild_settings()
 
     async def _migrate_guild_settings(self) -> None:

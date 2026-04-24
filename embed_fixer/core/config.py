@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     user_agent: str = USER_AGENT
     proxy_url: str | None = None
     heartbeat_url: str | None = None
+    media_download_dir: str = "/data/downloaded-images"
 
 
 load_dotenv()

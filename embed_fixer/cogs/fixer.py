@@ -12,6 +12,7 @@ from discord.ext import commands
 from loguru import logger
 from pydantic import BaseModel, field_validator
 
+from embed_fixer.core.config import settings as app_settings
 from embed_fixer.core.translator import DEFAULT_LANG, translator
 from embed_fixer.fixes import DOMAINS, AppendURLFix, DomainId
 from embed_fixer.models import GuildFixMethod, GuildSettings, IgnoreMe, UserSettings
@@ -28,6 +29,7 @@ from embed_fixer.utils.misc import (
     sanitize_username,
     unsanitize_username,
 )
+from embed_fixer.utils.message_archive import archive_fixed_message_embeds, archive_message
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -199,12 +201,18 @@ class FixerCog(commands.Cog):
 
     @staticmethod
     def _get_matching_domain_website(
-        settings: GuildSettings | None, clean_url: str
+        settings: GuildSettings | None,
+        clean_url: str,
+        *,
+        skipped_domain_ids: set[DomainId] | None = None,
     ) -> tuple[Domain | None, Website | None]:
         domain: Domain | None = None
         website: Website | None = None
 
         for d in DOMAINS:
+            if skipped_domain_ids is not None and d.id in skipped_domain_ids:
+                continue
+
             if settings is not None and d.id in settings.disabled_domains:
                 continue
 
@@ -226,6 +234,75 @@ class FixerCog(commands.Cog):
         # See https://github.com/FxEmbed/FxEmbed#translate-posts-xtwitter for more info
         return append_path_to_url(url, f"/{translang}")
 
+    @staticmethod
+    def _get_processed_url_pairs(original_urls: list[str], content: str) -> list[tuple[str, str]]:
+        processed_urls = [url for url, _ in extract_urls(content)]
+        return [
+            (original_url, processed_url)
+            for original_url, processed_url in zip(original_urls, processed_urls, strict=False)
+            if processed_url != original_url
+        ]
+
+    async def _archive_fixed_message_later(
+        self,
+        original_message: discord.Message,
+        fixed_message: discord.Message,
+        url_pairs: list[tuple[str, str]],
+        *,
+        filesize_limit: int,
+    ) -> None:
+        message_to_archive = fixed_message
+        for delay in (3, 7, 15):
+            await asyncio.sleep(delay)
+            fetch_message = getattr(fixed_message.channel, "fetch_message", None)
+            if fetch_message is not None:
+                try:
+                    message_to_archive = await fetch_message(fixed_message.id)
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                    logger.info(
+                        "Could not fetch fixed message for archive: "
+                        f"original_message_id={original_message.id}, "
+                        f"fixed_message_id={fixed_message.id}"
+                    )
+                    break
+
+            if message_to_archive.embeds:
+                downloaded_image_filenames = await self._download_fixed_embed_images(
+                    message_to_archive, filesize_limit=filesize_limit
+                )
+                await archive_fixed_message_embeds(
+                    original_message,
+                    message_to_archive,
+                    url_pairs=url_pairs,
+                    downloaded_image_filenames=downloaded_image_filenames,
+                )
+                return
+
+        downloaded_image_filenames = await self._download_fixed_embed_images(
+            message_to_archive, filesize_limit=filesize_limit
+        )
+        await archive_fixed_message_embeds(
+            original_message,
+            message_to_archive,
+            url_pairs=url_pairs,
+            downloaded_image_filenames=downloaded_image_filenames,
+        )
+
+    async def _download_fixed_embed_images(
+        self, fixed_message: discord.Message, *, filesize_limit: int
+    ) -> dict[str, str]:
+        image_urls = list(
+            dict.fromkeys(embed.image.url for embed in fixed_message.embeds if embed.image.url)
+        )
+        if not image_urls:
+            return {}
+
+        downloader = MediaDownloader(
+            self.bot.session, media_urls=image_urls, download_dir=app_settings.media_download_dir
+        )
+        await downloader.start(spoiler=False, filesize_limit=filesize_limit)
+        return downloader.local_filenames
+
     async def _find_fixes(  # noqa: C901, PLR0912, PLR0914, PLR0915
         self,
         message: discord.Message | MockMessage,
@@ -234,6 +311,7 @@ class FixerCog(commands.Cog):
         filesize_limit: int,
         extract_media: bool = False,
         is_ctx_menu: bool = False,
+        skipped_domain_ids: set[DomainId] | None = None,
     ) -> FindFixResult:
         channel_id = message.channel.id
 
@@ -266,11 +344,30 @@ class FixerCog(commands.Cog):
                 logger.warning(f"Invalid URL found: {url}")
                 continue
 
-            domain, website = self._get_matching_domain_website(settings, clean_url)
+            domain, website = self._get_matching_domain_website(
+                settings, clean_url, skipped_domain_ids=skipped_domain_ids
+            )
 
             if domain is None or website is None:
                 continue
             logger.debug(f"Matched domain {domain.id!r} for URL: {clean_url}")
+
+            if domain.id is DomainId.PTT:
+                nested_result, nested_content = await self._expand_ptt_url(
+                    message,
+                    url,
+                    settings=settings,
+                    filesize_limit=filesize_limit,
+                    extract_media=extract_media,
+                    is_ctx_menu=is_ctx_menu,
+                )
+                if nested_result is not None:
+                    fix_found = True
+                    medias.extend(nested_result.medias)
+                    sauces.extend(nested_result.sauces)
+                    content, author_md = nested_result.content, nested_result.author_md
+                    message.content = message.content.replace(url, nested_content)
+                    continue
 
             if await self._nsfw_skip(url, domain, is_nsfw_channel=is_nsfw_channel):
                 continue
@@ -365,6 +462,62 @@ class FixerCog(commands.Cog):
             author_md=author_md,
             urls=[url for url, _ in urls],
         )
+
+    async def _expand_ptt_url(
+        self,
+        message: discord.Message | MockMessage,
+        url: str,
+        *,
+        settings: GuildSettings | None,
+        filesize_limit: int,
+        extract_media: bool,
+        is_ctx_menu: bool,
+    ) -> tuple[FindFixResult | None, str]:
+        ptt_result = await self.fetch_info.ptt(url)
+        if ptt_result is None:
+            return None, url
+
+        _, embedded_urls = ptt_result
+        nested_urls: list[str] = []
+
+        for embedded_url in embedded_urls:
+            try:
+                clean_embedded_url = remove_query_params(embedded_url).replace("www.", "")
+            except ValueError:
+                continue
+
+            domain, _ = self._get_matching_domain_website(
+                settings,
+                clean_embedded_url,
+                skipped_domain_ids={DomainId.PTT},
+            )
+            if domain is None:
+                continue
+
+            nested_urls.append(embedded_url)
+
+        nested_urls = list(dict.fromkeys(nested_urls))
+        if not nested_urls:
+            return None, url
+
+        nested_message = MockMessage(
+            content="\n".join(nested_urls),
+            channel=message.channel,
+            guild=message.guild,
+            author=message.author,
+        )
+        nested_result = await self._find_fixes(
+            nested_message,
+            settings=settings,
+            filesize_limit=filesize_limit,
+            extract_media=extract_media,
+            is_ctx_menu=is_ctx_menu,
+            skipped_domain_ids={DomainId.PTT},
+        )
+        if not nested_result.fix_found:
+            return None, url
+
+        return nested_result, nested_message.content.strip()
 
     async def _extract_post_info(
         self, domain_id: DomainId, url: str, *, spoiler: bool = False, filesize_limit: int
@@ -495,7 +648,11 @@ class FixerCog(commands.Cog):
             )
 
         return await self._send_message(
-            message, urls=result.urls, guild_settings=guild_settings, interaction=interaction
+            message,
+            urls=result.urls,
+            guild_settings=guild_settings,
+            filesize_limit=filesize_limit,
+            interaction=interaction,
         )
 
     @staticmethod
@@ -562,6 +719,7 @@ class FixerCog(commands.Cog):
             send_type = await self._send_message(
                 message,
                 guild_settings=guild_settings,
+                filesize_limit=filesize_limit,
                 medias=chunk,
                 interaction=interaction,
                 **kwargs,
@@ -694,6 +852,7 @@ class FixerCog(commands.Cog):
         *,
         urls: list[str] | None = None,
         guild_settings: GuildSettings | None,
+        filesize_limit: int = DEFAULT_FILESIZE_LIMIT,
         medias: Sequence[Media] | None = None,
         interaction: Interaction | None = None,
         **kwargs: Any,
@@ -757,6 +916,18 @@ class FixerCog(commands.Cog):
             delete_msg_emoji=delete_msg_emoji,
             remove_delete_reaction_after=remove_delete_reaction_after,
         )
+        if fix_message is not None and urls:
+            url_pairs = self._get_processed_url_pairs(urls, message.content)
+            if url_pairs:
+                asyncio.create_task(
+                    self._archive_fixed_message_later(
+                        message,
+                        fix_message,
+                        url_pairs,
+                        filesize_limit=filesize_limit,
+                    )
+                )
+
         return send_type
 
     async def _add_delete_reaction(  # noqa: PLR0913
@@ -1049,6 +1220,8 @@ class FixerCog(commands.Cog):
         ):
             return
 
+        await archive_message(message)
+
         try:
             result = await self._find_fixes(
                 message, settings=guild_settings, filesize_limit=guild.filesize_limit
@@ -1060,6 +1233,11 @@ class FixerCog(commands.Cog):
         logger.debug(f"FindFixResult for message {message.id} in {guild.id=}: {result}")
 
         if result.fix_found:
+            await archive_message(
+                message,
+                url_pairs=self._get_processed_url_pairs(result.urls, message.content),
+                medias=result.medias,
+            )
             try:
                 send_type = await self._send_fixes(
                     message,
