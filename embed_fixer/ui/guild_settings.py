@@ -34,8 +34,8 @@ CHANNEL_SELECTOR_ROW_ID = 8
 ROLE_SELECTOR_ROW_ID = 9
 
 NO_HEADER_SETTINGS = {
-    GuildSetting.TOGGLE_WEBHOOK_REPLY,
-    GuildSetting.TOGGLE_DELETE_REACTION,
+    GuildSetting.DISABLE_WEBHOOK_REPLY,
+    GuildSetting.DISABLE_DELETE_REACTION,
     GuildSetting.BOT_VISIBILITY,
     GuildSetting.SHOW_ORIGINAL_LINK_BUTTON,
     GuildSetting.DELETE_ORIGINAL_MESSAGE_IN_THREADS,
@@ -59,8 +59,8 @@ ROLE_SETTING_ATTRS: dict[GuildSetting, str] = {
 }
 
 TOGGLE_SETTING_ATTRS: dict[GuildSetting, str] = {
-    GuildSetting.TOGGLE_WEBHOOK_REPLY: "disable_webhook_reply",
-    GuildSetting.TOGGLE_DELETE_REACTION: "disable_delete_reaction",
+    GuildSetting.DISABLE_WEBHOOK_REPLY: "disable_webhook_reply",
+    GuildSetting.DISABLE_DELETE_REACTION: "disable_delete_reaction",
     GuildSetting.BOT_VISIBILITY: "bot_visibility",
     GuildSetting.SHOW_ORIGINAL_LINK_BUTTON: "show_original_link_btn",
     GuildSetting.DELETE_ORIGINAL_MESSAGE_IN_THREADS: "delete_original_message_in_threads",
@@ -90,6 +90,77 @@ class DeleteMsgEmojiModal(ui.Modal):
 
         await i.response.send_message(
             content=translator.translate("emoji_changed", lang=self.lang, emoji=emoji),
+            ephemeral=True,
+        )
+
+
+MIN_SECONDS = 1
+MAX_SECONDS = 3600  # 1 hour
+
+
+class RemoveDeleteReactionAfterModal(ui.Modal):
+    seconds = ui.Label(
+        text="seconds", component=ui.TextInput(max_length=19, placeholder="...", required=False)
+    )
+
+    def __init__(self, *, settings: GuildSettings) -> None:
+        self.lang = lang = settings.lang or DEFAULT_LANG
+        super().__init__(title_key="remove_delete_reaction_after", lang=settings.lang)
+
+        self.seconds.text = translator.translate("seconds", lang=lang)
+        self.seconds.component.placeholder = translator.translate(
+            "seconds_placeholder", lang=lang, min=MIN_SECONDS, max=MAX_SECONDS
+        )
+        self.seconds.component.default = (
+            str(settings.remove_delete_reaction_after)
+            if settings.remove_delete_reaction_after is not None
+            else None
+        )
+        self.settings = settings
+
+    async def on_submit(self, i: Interaction) -> None:
+        raw = self.seconds.component.value.strip()
+
+        guild_settings, _ = await GuildSettings.get_or_create(id=self.settings.id)
+
+        if not raw:
+            guild_settings.remove_delete_reaction_after = None
+            await guild_settings.save(update_fields=("remove_delete_reaction_after",))
+            await i.response.send_message(
+                content=translator.translate(
+                    "remove_delete_reaction_after_disabled", lang=self.lang
+                ),
+                ephemeral=True,
+            )
+            return
+
+        try:
+            seconds = int(raw)
+        except ValueError:
+            await i.response.send_message(
+                content=translator.translate(
+                    "invalid_seconds", lang=self.lang, min=MIN_SECONDS, max=MAX_SECONDS
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if seconds < MIN_SECONDS or seconds > MAX_SECONDS:
+            await i.response.send_message(
+                content=translator.translate(
+                    "invalid_seconds", lang=self.lang, min=MIN_SECONDS, max=MAX_SECONDS
+                ),
+                ephemeral=True,
+            )
+            return
+
+        guild_settings.remove_delete_reaction_after = seconds
+        await guild_settings.save(update_fields=("remove_delete_reaction_after",))
+
+        await i.response.send_message(
+            content=translator.translate(
+                "remove_delete_reaction_after_changed", lang=self.lang, seconds=seconds
+            ),
             ephemeral=True,
         )
 
