@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from embed_fixer.cogs.fixer import Media
 
 
+# The archive tables are maintained manually because this feature supports both
+# SQLite and PostgreSQL without relying on a shared migration path.
 MESSAGE_ARCHIVE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS message
 (
@@ -113,6 +115,8 @@ def _postgres_timestamp(value: dt.datetime | None) -> dt.datetime | None:
 
 
 def _normalize_url_for_match(url: str | None) -> str:
+    # Match original and fixed social URLs by their stable post identity.
+    # This lets x.com/twitter.com/fixupx.com variants point to the same row.
     if not url:
         return ""
 
@@ -179,6 +183,8 @@ def _set_original_url_for_processed_url(
 
 
 async def init_message_archive_schema() -> None:
+    # Called once during bot startup. Existing tables are left untouched, so this
+    # only creates the archive schema for fresh databases.
     db = get_connection("default")
     schema = None
     if db.capabilities.dialect == "sqlite":
@@ -206,6 +212,8 @@ async def archive_message(
     url_pairs: list[tuple[str, str]] | None = None,
     medias: list[Media] | None = None,
 ) -> None:
+    # Entry point for normal Discord messages. This writes the source message,
+    # its attachments, current embeds, and any extracted media rows.
     try:
         db = get_connection("default")
         if db.capabilities.dialect == "sqlite":
@@ -232,6 +240,10 @@ async def archive_fixed_message_embeds(
     url_pairs: list[tuple[str, str]],
     downloaded_image_filenames: Mapping[str, str] | None = None,
 ) -> None:
+    # Entry point for the delayed webhook/fixed-message pass. The fixed message
+    # may receive embeds a few seconds after send, so fixer.py fetches it later
+    # and calls this to replace the original message's archived embed rows with
+    # the richer fixed embed metadata.
     try:
         db = get_connection("default")
         if not fixed_message.embeds:
@@ -308,6 +320,8 @@ async def _archive_sqlite_message(
     await db.execute_query('DELETE FROM "embed" WHERE message_id = ?', [message_id])
     await db.execute_query('DELETE FROM "attachment" WHERE message_id = ?', [message_id])
 
+    # Attachments are copied from the original Discord message. Downloaded
+    # extracted media is stored in the embed table later, not here.
     attachment_rows = [
         [
             str(attachment.id),
@@ -332,6 +346,7 @@ async def _archive_sqlite_message(
 
     embed_rows: list[list[object | None]] = []
     for embed in message.embeds:
+        # First snapshot whatever Discord already exposed on the source message.
         timestamp_value = embed.timestamp.isoformat() if embed.timestamp else embed_timestamp
         embed_rows.append(
             [
@@ -354,6 +369,9 @@ async def _archive_sqlite_message(
         )
 
     if existing_embed_rows:
+        # A later archive pass can add processed URLs or downloaded media after
+        # fixed embeds were already saved. Preserve existing enriched rows and
+        # merge the new URL/media data below instead of throwing them away.
         embed_rows = [
             [
                 message_id,
@@ -376,6 +394,8 @@ async def _archive_sqlite_message(
         ]
 
     for original_url, processed_url in url_pairs:
+        # url_pairs map the user's original URL to the bot's fixed URL. If the
+        # fixed URL already has an embed row, keep that row and fill orginal_url.
         if _merge_processed_url(
             embed_rows,
             original_url=original_url,
@@ -405,6 +425,8 @@ async def _archive_sqlite_message(
         )
 
     for media in medias:
+        # Extracted/downloaded media gets one embed-table row per media URL so
+        # image_url/local_filename/is_downloaded can be queried directly.
         local_filename = None if media.file is None else media.file.filename
         embed_rows.append(
             [
@@ -454,6 +476,8 @@ async def _archive_sqlite_fixed_message_embeds(
 
     embed_rows: list[list[object | None]] = []
     for embed in fixed_message.embeds:
+        # Fixed-message embeds are the best source for rich metadata generated
+        # by the target site, including author, footer, image, and timestamps.
         timestamp_value = embed.timestamp.isoformat() if embed.timestamp else timestamp
         image_url = embed.image.url
         local_filename = None if image_url is None else downloaded_image_filenames.get(image_url)
@@ -478,6 +502,7 @@ async def _archive_sqlite_fixed_message_embeds(
         )
 
     for original_url, processed_url in url_pairs:
+        # Link fixed embed rows back to the user's original URL when possible.
         _set_original_url_for_processed_url(
             embed_rows,
             processed_url=processed_url,
@@ -547,6 +572,8 @@ async def _archive_postgres_message(
     await db.execute_query('DELETE FROM "embed" WHERE message_id = $1', [message_id])
     await db.execute_query('DELETE FROM "attachment" WHERE message_id = $1', [message_id])
 
+    # Attachments stay separate from extracted media. Extracted media is written
+    # as embed rows because it carries image_url/local_filename state.
     attachment_rows = [
         [
             message_id,
@@ -570,6 +597,7 @@ async def _archive_postgres_message(
 
     embed_rows: list[list[object | None]] = []
     for embed in message.embeds:
+        # First snapshot whatever Discord already exposed on the source message.
         embed_rows.append(
             [
                 message_id,
@@ -592,6 +620,8 @@ async def _archive_postgres_message(
         )
 
     if existing_embed_rows:
+        # Preserve rows saved by the delayed fixed-message archive when this
+        # message is archived again with additional URL/media data.
         embed_rows = [
             [
                 message_id,
@@ -615,6 +645,8 @@ async def _archive_postgres_message(
         ]
 
     for original_url, processed_url in url_pairs:
+        # url_pairs map the user's original URL to the bot's fixed URL. If the
+        # fixed URL already has an embed row, keep that row and fill orginal_url.
         if _merge_processed_url(
             embed_rows,
             original_url=original_url,
@@ -646,6 +678,8 @@ async def _archive_postgres_message(
         )
 
     for media in medias:
+        # Extracted/downloaded media gets one embed-table row per media URL so
+        # image_url/local_filename/is_downloaded can be queried directly.
         local_filename = None if media.file is None else media.file.filename
         embed_rows.append(
             [
@@ -699,6 +733,8 @@ async def _archive_postgres_fixed_message_embeds(
 
     embed_rows: list[list[object | None]] = []
     for embed in fixed_message.embeds:
+        # Fixed-message embeds are the best source for rich metadata generated
+        # by the target site, including author, footer, image, and timestamps.
         image_url = embed.image.url
         local_filename = None if image_url is None else downloaded_image_filenames.get(image_url)
         embed_rows.append(
@@ -723,12 +759,28 @@ async def _archive_postgres_fixed_message_embeds(
         )
 
     for original_url, processed_url in url_pairs:
+        # Link fixed embed rows back to the user's original URL when possible.
         _set_original_url_for_processed_url(
             embed_rows,
             processed_url=processed_url,
             stored_original_url=_truncate(original_url, 512) or "",
             original_url_index=14,
         )
+
+    for index in (3, 4, 5, 6, 7, 8, 12, 14):
+        values = [
+            row[index]
+            for row in embed_rows
+            if row[index] is not None and row[index] != ""
+        ]
+        unique_values = list(dict.fromkeys(values))
+        if len(unique_values) != 1:
+            continue
+
+        value = unique_values[0]
+        for row in embed_rows:
+            if row[index] is None or row[index] == "":
+                row[index] = value
 
     await db.execute_query('DELETE FROM "embed" WHERE message_id = $1', [message_id])
     await db.execute_many(
